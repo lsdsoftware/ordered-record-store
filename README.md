@@ -2,61 +2,74 @@
 
 A small TypeScript ESM module for appending and retrieving opaque records in order.
 
-The package is intentionally domain-neutral. It knows about streams and records; it does not know about users, buddies, messages, conversations, or any host application.
+The package is deliberately domain-neutral. It knows about streams, records, and storage lifecycle; it does not know about users, buddies, messages, conversations, or any host application.
 
-## Current status
+## Design status
 
-The only implementation is memory-only. It is intended to unblock development and tests in `apsvc-diepkhuc-messenger` while the durable implementation is deferred.
+The durable design is a **working design, not a frozen contract**. The only checked-in implementation is currently memory-only and still exposes the earlier draft API with storage-level idempotency and `deleteStream()`. That code is useful for Messenger development, but it is not the target durable contract and will be changed deliberately.
 
-**All records disappear when the process exits. Do not use the memory store as production persistence.**
+All memory-store records disappear when the process exits. Do not deploy it as production persistence.
 
-## Usage
+The intended production adapter stores active segments on durable local storage and archives/checkpoints them to S3:
+
+```text
+append opaque record
+  -> append complete framed record to local active segment
+  -> durably flush local file
+  -> acknowledge caller
+  -> checkpoint dirty active prefix to S3 after at most about five minutes
+  -> seal to immutable S3 object at about 256 KiB or after 14 idle days
+```
+
+S3 is never on the synchronous append path. The design accepts up to roughly five minutes of loss only when the local durable volume itself is catastrophically lost.
+
+## Target API direction
+
+The next interface revision is expected to retain:
+
+- `append({ streamId, data })`
+- `read({ streamId, beforeId?, afterId?, limit })`
+- `getLatest(streamIds)`
+- `compareRecordIds(left, right)` and explicit async `close()`
+- opaque string stream IDs, record IDs, and record data
+
+It is expected to remove:
+
+- caller-supplied `idempotencyKey`
+- `AppendResult.duplicate`
+- `IDEMPOTENCY_CONFLICT`
+- `deleteStream()`
+
+The store does not permanently deduplicate caller requests. A consuming application may perform cheap, domain-aware best-effort duplicate suppression at the stream head. Rare duplicates are preferable here to a durable side index and its recovery rules.
+
+The durable design uses per-record UUIDv7 values internally. Its public 43-character base64url cursor contains both the record UUID and its segment UUID, allowing exact segment lookup without a manifest. Consumers still treat the value as opaque and use `compareRecordIds()` rather than relying on the memory adapter's current decimal IDs. The async durable factory returns only after startup reconciliation; startup fails if S3 cannot be fully reconciled.
+
+## Segment lifecycle summary
+
+- One active segment generation exists only while a stream is active.
+- Append complete records and rotate after the resulting file reaches approximately 256 KiB; overshoot by one record is fine.
+- Also seal after 14 days without a successful append.
+- Sealed segments are immutable.
+- A later append to a dormant stream creates a new independently identified active segment. It does not unseal or download the previous segment.
+- The first append that makes a clean active segment dirty sets a five-minute checkpoint deadline. Later appends do not move it.
+- No per-stream manifest, persisted catalog, or dirty-marker file is maintained.
+- Startup rebuilds the in-memory catalog from the complete active frontier, but sealed history remains lazy.
+- Normal startup performs local file inspection plus paginated S3 listing and size reconciliation. It does not download every active checkpoint.
+- Version 1 uses a small custom big-endian binary frame with leading/trailing lengths and CRC32C, plus SHA-256 for each S3 upload; it does not use Protobuf.
+
+See [docs/DESIGN.md](docs/DESIGN.md) for the complete recovery cases, decisions, open questions, and implementation sequence.
+
+## Current development usage
+
+Until the breaking interface revision lands, the existing memory adapter can still be created with:
 
 ```ts
 import { createMemoryOrderedRecordStore } from '@lsdsoftware/ordered-record-store'
 
 const store = createMemoryOrderedRecordStore()
-
-const { record, duplicate } = await store.append({
-  streamId: 'conversation-018f4f4e',
-  idempotencyKey: 'client-request-4e7e',
-  data: JSON.stringify({ version: 1, senderId: '42', text: 'Hello' }),
-})
-
-const latestMessages = await store.read({
-  streamId: record.streamId,
-  limit: 50,
-})
 ```
 
-Create one store instance when the Messenger process starts and share it across all request handlers and client connections. Creating a store per request would create isolated histories.
-
-## API behavior
-
-- `append()` assigns a globally increasing record ID represented as a string.
-- Records in one stream are ordered by that ID.
-- Retrying an append with the same stream, idempotency key, and data returns the original record with `duplicate: true`.
-- Reusing an idempotency key with different data throws `IDEMPOTENCY_CONFLICT`.
-- `read()` uses record IDs for keyset pagination and always returns results in ascending order.
-- With neither `beforeId` nor `afterId`, `read()` returns the newest page.
-- `beforeId` loads an older page; `afterId` loads records for forward catch-up.
-- `getLatest()` retrieves the current head of several streams in one call.
-- `deleteStream()` is idempotent.
-- Deleting a stream also clears its idempotency history. The same stream ID and idempotency keys may be used again afterward.
-
-Record IDs are decimal strings in the current implementation, but consumers should treat them as opaque values and must not convert them to JavaScript numbers.
-
-Public limits are exported as constants:
-
-- Stream IDs and idempotency keys: at most 64 UTF-8 bytes
-- Record data: at most 65,535 UTF-8 bytes
-- Read limit: at most 1,000 records
-
-`createdAt` is a UTC ISO-8601 timestamp with millisecond precision.
-
-For older pagination, pass the first returned record's ID as the next `beforeId`. For forward catch-up, pass the last returned record's ID as `afterId`. Fewer records than the requested limit means that direction is currently exhausted. Boundary IDs are numeric ordering boundaries and do not need to exist in the requested stream.
-
-Invalid requests and idempotency conflicts throw `OrderedRecordStoreError`. Consumers can inspect its `code`, currently `INVALID_ARGUMENT` or `IDEMPOTENCY_CONFLICT`.
+Create one instance per consuming process and inject it into all handlers. The checked-in TypeScript declarations and tests describe the current mock API; this document and `docs/DESIGN.md` describe the intended next revision.
 
 ## Commands
 
@@ -68,6 +81,4 @@ npm test
 npm run build
 ```
 
-The package has not yet been wired into `apsvc-diepkhuc-messenger` or published. A local `file:` dependency versus publishing to npm remains an integration decision. The `prepare` script builds `dist` when installing directly from a Git or local package source.
-
-See [docs/DESIGN.md](docs/DESIGN.md) for project context, design boundaries, Messenger integration, and the deferred durable implementation.
+The package is already consumed by `apsvc-diepkhuc-messenger` through a local `file:` dependency. Publishing or pinning a reproducible package version remains deployment work.
