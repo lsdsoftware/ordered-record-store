@@ -6,11 +6,12 @@ The package is deliberately domain-neutral. It knows about streams, records, and
 
 ## Design status
 
-The durable design is a **working design, not a frozen contract**. The only checked-in implementation is currently memory-only and still exposes the earlier draft API with storage-level idempotency and `deleteStream()`. That code is useful for Messenger development, but it is not the target durable contract and will be changed deliberately.
+The durable design is a **working design, not a frozen contract**. The package now
+includes both the memory adapter used by fast tests and the segmented local/S3
+adapter described below. Memory-store records disappear when the process exits;
+do not deploy that adapter as production persistence.
 
-All memory-store records disappear when the process exits. Do not deploy it as production persistence.
-
-The intended production adapter uses durable local working segments as a write-back cache over one S3 segment namespace:
+The durable adapter uses local working segments as a write-back cache over one S3 segment namespace:
 
 ```text
 append opaque record
@@ -23,9 +24,9 @@ append opaque record
 
 S3 is never on the synchronous append path. The design accepts up to roughly five minutes of loss only when the local durable volume itself is catastrophically lost.
 
-## Target API direction
+## Public API
 
-The next interface revision is expected to retain:
+The current interface provides:
 
 - `append({ streamId, data })`
 - `read({ streamId, beforeId?, afterId?, limit })`
@@ -33,16 +34,12 @@ The next interface revision is expected to retain:
 - `compareRecordIds(left, right)` and explicit async `close()`
 - opaque string stream IDs, record IDs, and record data
 
-It is expected to remove:
+The old caller-supplied idempotency key, duplicate result, and stream-deletion API
+have been removed. The store does not permanently deduplicate caller requests. A
+consuming application may perform cheap, domain-aware best-effort duplicate
+suppression at the stream head.
 
-- caller-supplied `idempotencyKey`
-- `AppendResult.duplicate`
-- `IDEMPOTENCY_CONFLICT`
-- `deleteStream()`
-
-The store does not permanently deduplicate caller requests. A consuming application may perform cheap, domain-aware best-effort duplicate suppression at the stream head. Rare duplicates are preferable here to a durable side index and its recovery rules.
-
-The durable design uses per-record UUIDv7 values internally. Its public 43-character base64url cursor contains both the record UUID and its segment UUID, allowing exact segment lookup without a manifest. Consumers still treat the value as opaque and use `compareRecordIds()` rather than relying on the memory adapter's current decimal IDs. The async durable factory reconstructs local files only and performs no S3 availability check at startup.
+The durable design uses per-record UUIDv7 values internally. Its public 43-character base64url cursor contains both the record UUID and its segment UUID, allowing exact segment lookup without a manifest. Both adapters use this format. Consumers treat it as opaque and call `compareRecordIds()` only when record ordering is actually required. The async durable factory reconstructs local files only and performs no S3 availability check at startup.
 
 ## Segment lifecycle summary
 
@@ -53,15 +50,16 @@ The durable design uses per-record UUIDv7 values internally. Its public 43-chara
 - If no local file exists, locate the newest S3 segment with one newest-first listing. Download it when it is below the rotation target; otherwise create a new segment.
 - After 14 days without a successful append, evict the normally clean local copy. A dirty-and-idle file is an exceptional long-outage recovery case and must upload successfully before eviction. This is cache eviction, not sealing.
 - Startup validates local files, reconstructs only the local working set, and queues dirty uploads. It performs no S3 probe, listing, or download.
+- Nonlocal segments are fetched as complete objects and retained in a disposable 64-segment in-memory LRU, avoiding repeat `GetObject` calls during continued pagination.
 - The MVP assumes exactly one store/service instance.
 - The bucket has versioning disabled and never transitions segment objects to Glacier or another restore-required storage class.
 - Version 1 uses a small custom big-endian binary frame with leading/trailing lengths and CRC32C, plus SHA-256 for each S3 upload; it does not use Protobuf.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the complete recovery cases, decisions, open questions, and implementation sequence.
 
-## Current development usage
+## Usage
 
-Until the breaking interface revision lands, the existing memory adapter can still be created with:
+The memory adapter is created with:
 
 ```ts
 import { createMemoryOrderedRecordStore } from '@lsdsoftware/ordered-record-store'
@@ -69,7 +67,31 @@ import { createMemoryOrderedRecordStore } from '@lsdsoftware/ordered-record-stor
 const store = createMemoryOrderedRecordStore()
 ```
 
-Create one instance per consuming process and inject it into all handlers. The checked-in TypeScript declarations and tests describe the current mock API; this document and `docs/DESIGN.md` describe the intended next revision.
+The durable adapter is opened asynchronously with an explicit persistent local
+directory and an injected object-store boundary:
+
+```ts
+import {
+  createS3SegmentObjectStore,
+  openSegmentedOrderedRecordStore,
+} from '@lsdsoftware/ordered-record-store'
+import { S3Client } from '@aws-sdk/client-s3'
+
+const objectStore = createS3SegmentObjectStore({
+  client: new S3Client({ region: 'ap-southeast-1' }),
+  bucket: 'example-ordered-records',
+  keyPrefix: 'messenger',
+})
+
+const store = await openSegmentedOrderedRecordStore({
+  dataDirectory: '/var/lib/diepkhuc/ordered-record-store',
+  objectStore,
+})
+```
+
+Create one instance per consuming process and inject it into all handlers. The
+application owns AWS client configuration and credentials. Call `close()` during
+graceful shutdown; dirty local files are recovered and queued on the next start.
 
 ## Commands
 

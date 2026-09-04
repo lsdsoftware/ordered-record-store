@@ -6,11 +6,11 @@
 
 ## Current status
 
-- The public `OrderedRecordStore` interface is defined in `src/index.ts`.
-- `createMemoryOrderedRecordStore()` is the only implementation.
-- The memory implementation is for Messenger development and tests only; it loses all data on process exit.
-- The checked-in memory interface reflects an earlier draft. The working design intentionally removes permanent idempotency and `deleteStream()` before implementing durability.
-- The intended durable adapter uses fsynced local working segments and asynchronously overwrites the newest segment in one S3 `segments/v1/` namespace. Older segments become immutable when rotation creates a newer one. It does not store one database row per record.
+- Version 0.2.0 implements the current public `OrderedRecordStore` contract.
+- `createMemoryOrderedRecordStore()` is the development/test adapter and loses all data on process exit.
+- `openSegmentedOrderedRecordStore()` is the durable local/S3 adapter. It fsyncs local segment files before acknowledging appends and checkpoints them asynchronously to S3.
+- Permanent storage idempotency and `deleteStream()` are intentionally absent. Domain-specific retry handling belongs to callers.
+- The package has 19 contract, S3 mapping, and durability tests. Run `npm test` after changing behavior or framing.
 
 ## Commands
 
@@ -20,7 +20,7 @@ npm test
 npm run build
 ```
 
-Node.js 20 or newer is required. Create one memory-store instance per consuming process, not one per request or connection.
+Node.js 20 or newer is required. Create one store instance per consuming process, not one per request or connection.
 
 ## Design constraints
 

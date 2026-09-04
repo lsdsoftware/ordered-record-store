@@ -6,7 +6,11 @@ Last updated: 2026-09-04
 
 This document is the continuation point for the durable `ordered-record-store` implementation. It supersedes the earlier MySQL-row design and incorporates the useful reasoning formerly kept in `docs/STACK.md`.
 
-The current memory implementation and its tests still expose the earlier interface. They are expected to change. Do not preserve an old API, Messenger assumption, or test merely because it has already been implemented; revise this document deliberately when a better decision is made.
+The memory and segmented local/S3 adapters now implement this interface and
+format. The design remains deliberately thawed: do not preserve an API,
+Messenger assumption, or implementation merely because it has shipped in this
+working branch; revise this document deliberately when a better decision is
+made.
 
 ## 1. Purpose and scale
 
@@ -41,9 +45,9 @@ The store does not own:
 
 The consuming service owns stream-ID derivation, payload encoding, access control, user-facing failure behavior, and any cheap domain-aware duplicate suppression.
 
-## 3. Target public contract
+## 3. Public contract
 
-The next breaking revision should retain the conceptual operations:
+The implemented contract exposes:
 
 ```ts
 interface StoredRecord {
@@ -118,7 +122,7 @@ Runtime S3 checkpoint failures do not make already fsynced local appends fail. T
 
 Each local file belongs to one opaque stream and one unique segment. The segment ID is the UUIDv7 record ID of its first record; a segment is created only as part of its first append, so there are no empty segment files. The stream ID is present in the segment header so path hashes are not the only copy of identity.
 
-Use a custom versioned envelope rather than Protobuf, CBOR, or MessagePack. Those encodings do not provide reverse framing, torn-tail detection, or S3 range-read boundaries, so they would still need the same outer format. The fixed envelope is small enough to implement and test directly, while caller data remains an opaque UTF-8 string.
+Use a custom versioned envelope rather than Protobuf, CBOR, or MessagePack. Those encodings do not provide record framing, torn-tail detection, or per-record integrity, so they would still need the same outer format. The fixed envelope is small enough to implement and test directly, while caller data remains an opaque UTF-8 string.
 
 Version 1 is uncompressed. Future segments may use other codecs without rewriting existing objects because the header identifies the format and codec.
 
@@ -249,7 +253,7 @@ The store trusts a clean local marker under the single-writer invariant. It does
 
 ## 11. Reads and lazy segment discovery
 
-Local files support forward and reverse scan through their framing. Nonlocal version-1 objects remain uncompressed so the durable adapter can use range reads near the object tail rather than download an entire segment merely to return a recent page.
+Local files support forward and reverse scan through their framing. Nonlocal version-1 objects remain uncompressed and are always fetched as complete objects. At the approximately 256 KiB target, an extra range-read path saves little bandwidth while making later pagination likely to issue another request.
 
 For an append with no local working file, serialize the stream operation and issue a newest-first `ListObjectsV2` for that stream with `MaxKeys=1`:
 
@@ -259,11 +263,11 @@ For an append with no local working file, serialize the stream operation and iss
 
 Downloading the whole object on the last path is intentional: the segment is only approximately 256 KiB, and its next checkpoint must upload a complete replacement object. Concurrent cache-miss work and all later mutations for that stream use the same per-stream serialization.
 
-A read or `getLatest()` uses the local newest segment when present. Otherwise it performs the same one-object newest-first listing and range-reads the returned object's tail. Reading does not need to install a full local working copy.
+A read or `getLatest()` uses a local segment when present. Otherwise it fetches, validates, and decodes the complete object, then retains it in a process-local 64-segment least-recently-used cache. Continued pagination and a later append can reuse those bytes without another `GetObject`; an append installs a reusable below-target object as the clean local working file before modifying it. The cache is disposable, is not scanned at startup, and is invalidated whenever this process successfully overwrites the corresponding S3 object.
 
 A `beforeId` or `afterId` cursor contains its segment UUID, so the store derives the exact local or S3 key directly. When backward pagination exhausts that segment, one newest-first prefix listing starting after its inverted segment key finds the immediately older segment. It does not enumerate the stream's entire history.
 
-Optional per-segment offset indexes or read caches may be introduced only after measuring performance. They are not required for the initial approximately 256 KiB segments.
+Optional per-segment offset indexes may be introduced only after measuring performance. They are not required for the initial approximately 256 KiB segments or its small bounded decoded-object cache.
 
 `getLatest(streamIds)` for many nonlocal streams may translate into several lazy S3 lookups. For the MVP, perform them with bounded concurrency and do not add a conversation-head table or generic global manifest. Measure real snapshot latency before adding another projection.
 
@@ -293,29 +297,39 @@ The browser should not automatically retry uncertain sends. Realtime client dedu
 - Startup itself does not contact S3 and therefore does not fail merely because S3 is unavailable. Cache-miss operations that require S3 fail until it recovers.
 - Loss of S3 segment objects is outside the module's ordinary recovery model and belongs to bucket durability and external backup policy.
 
-## 14. Initial implementation sequence
+## 14. Implementation status and remaining sequence
 
-1. Revise the public interface, memory adapter, shared contract tests, and package documentation to remove permanent idempotency and deletion.
-2. Revise Messenger payload/deduplication assumptions and move private read positions to compact Messenger-owned MySQL state.
-3. Implement the documented record IDs/cursors, binary layout, segment IDs, key layout, and async open/close shape as contract tests.
-4. Implement and exhaustively test binary framing, reverse scans, checksum validation, and torn-tail recovery without S3.
-5. Implement the local durable adapter with per-stream serialization, durable clean/dirty filenames, fsynced append, size rotation, and idle cache eviction.
-6. Inject an object-store boundary and test checkpoint audit timing, captured-prefix uploads, retries, final rotated-segment upload, and clean-only eviction against a fake implementation.
-7. Add the S3 implementation, newest-segment discovery, cache-miss download/reactivation, lazy range reads, and local-only startup.
-8. Run the same behavior suite against memory and durable adapters plus restart/fault tests.
-9. Integrate the durable adapter into Messenger, gate broker readiness on local reconstruction, and rehearse restart/offline-history behavior.
-10. Document local volume, S3 bucket/lifecycle, recovery, and deployment configuration before production cutover.
+As of 2026-09-04, the package implements the public contract, memory adapter,
+UUIDv7 cursor, binary codec, durable local adapter, object-store boundary, S3
+adapter, lazy reads, checkpointing, rotation, restart recovery, and idle
+eviction. The suite runs the shared behavior contract against both adapters and
+covers CRC32C, torn dirty tails, local-only startup, audit timing, append/upload
+overlap, upload retry, ordered rotation, remote rehydration and cached whole-object
+reads, clean cache corruption, and idle eviction.
+
+Messenger's payload revision, best-effort head deduplication, compact MySQL read
+positions, composition-root selection, and restart test are implemented in the
+consuming backend. Remaining work is deployment-specific:
+
+1. Create the Messenger read-position table in the deployment database.
+2. Provision the dedicated bucket and persistent local data directory.
+3. Choose a reproducible package reference instead of the development `file:`
+   dependency.
+4. Rehearse the service against the real development broker, database, local
+   volume, and bucket, including restart and temporary S3 failure.
+5. Configure disk/backlog visibility and write the final operator recovery notes
+   for the chosen host paths.
 
 ## 15. Recommended implementation defaults
 
 The binary format and single-prefix mutable-latest design above were explicitly accepted by 2026-09-04. Treat the remaining recommendations below as implementation defaults unless later evidence causes a deliberate revision:
 
-- **Object-store boundary:** define a small internal interface for list, put, and range/full get. Test it with an in-memory fake. The production implementation wraps an injected AWS SDK v3 `S3Client`; credentials and region remain composition-root concerns.
+- **Object-store boundary:** define a small internal interface for list, put, and complete-object get. Test it with an in-memory fake. The production implementation wraps an injected AWS SDK v3 `S3Client`; credentials and region remain composition-root concerns.
 - **S3 concurrency:** use one configurable limiter with a default of four in-flight object operations. Prioritize dirty/final segment uploads over user-triggered nonlocal reads. Serialize uploads per segment.
 - **Bucket kind:** require a general-purpose S3 bucket. The newest-first key design relies on lexicographical `ListObjectsV2` ordering and therefore does not support S3 Express directory buckets.
 - **Local volume:** require an explicit absolute data-directory path on persistent local SSD/block storage. Do not silently use the process working directory, `/tmp`, a container layer, or NFS. Store version-1 files under `<dataDirectory>/v1/segments/<shard>/<stream-hash>/<segment-id>.clean.ors` or `<segment-id>.dirty.ors`.
 - **Disk capacity:** begin with at least 10 GiB for the local working set and an ordinary host disk-space alarm. Evict clean current files after 14 idle days and delete clean noncurrent files after final upload. Retain dirty files until upload succeeds. `ENOSPC` fails append rather than acknowledging an unflushed record.
-- **Local segment cache:** retain the current below-target segment while active. After 14 days without append, evict it if clean; the dirty-and-idle case is exceptional and must finish uploading before eviction. Use S3 range reads for ordinary nonlocal history and download a whole below-target newest segment only when a new append needs to continue it.
+- **Segment caches:** retain the current below-target segment locally while active. After 14 days without append, evict it if clean; the dirty-and-idle case is exceptional and must finish uploading before eviction. Fetch complete nonlocal objects and keep at most 64 in a disposable in-memory LRU so continued pagination does not repeat `GetObject` for the same segment.
 - **Private read state:** move Messenger read positions to one mutable MySQL row per directional `(accountId, buddyId)` pair. This is compact current state, not append-only history, and does not belong in tiny ordered-record streams.
 - **Conversation-head projection:** do not add one initially. Use bounded lazy `getLatest()` S3 lookups for nonlocal conversations and measure snapshot latency before accepting dual-write/projection complexity.
 - **S3 versioning/lifecycle:** use a dedicated bucket with versioning disabled for this store. Keep segment objects indefinitely. Standard is sufficient; an optional transition to Standard-IA is allowed because reads remain immediate. Never transition these objects to Glacier or any restore-required archival tier.
@@ -339,7 +353,7 @@ The binary format and single-prefix mutable-latest design above were explicitly 
 
 1. Read this document completely and then `README.md`.
 2. Read `../../../DiepKhucProjects/apsvc-diepkhuc-messenger/docs/MVP-CONTRACT.md`, especially its storage mapping and current implementation status.
-3. Inspect `src/index.ts` and its tests, remembering that they implement the older draft API.
-4. Inspect how `apsvc-diepkhuc-messenger` currently uses idempotency, decimal IDs, `getLatest()`, and read-position streams.
+3. Inspect `src/index.ts` and `test/index.test.mjs`; they implement the current candidate contract and both adapters.
+4. Inspect how `apsvc-diepkhuc-messenger` uses head-only retry suppression, opaque message cursors, `getLatest()`, and MySQL read positions.
 5. Start with the section 15 defaults and record any deliberate revision here before relying on it in code.
 6. Keep the durable adapter domain-neutral and resist copying the abandoned Messenger v2 S3 implementation wholesale.
