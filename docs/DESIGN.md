@@ -2,7 +2,7 @@
 
 Status: **Canonical working design — deliberately not frozen**
 
-Last updated: 2026-09-03
+Last updated: 2026-09-04
 
 This document is the continuation point for the durable `ordered-record-store` implementation. It supersedes the earlier MySQL-row design and incorporates the useful reasoning formerly kept in `docs/STACK.md`.
 
@@ -26,9 +26,9 @@ The store owns:
 - assigning canonical record IDs and timestamps;
 - ordered newest, older, and forward reads;
 - local segment framing, flushing, recovery, and rotation;
-- S3 active checkpoints and immutable sealed archives;
-- rebuilding its in-memory active catalog at startup;
-- lazy discovery and reading of sealed history.
+- checkpointing local working segments into a single S3 segment namespace;
+- rebuilding its in-memory local working-set catalog at startup;
+- lazy discovery, download, and reading of nonlocal segments.
 
 The store does not own:
 
@@ -72,7 +72,7 @@ declare function openSegmentedOrderedRecordStore(
 ): Promise<OrderedRecordStore>
 ```
 
-`openSegmentedOrderedRecordStore()` performs all startup reconstruction and returns only when the store is ready. `close()` rejects new work, waits for in-flight per-stream mutations and already-running S3 operations, flushes and closes local handles, and stops timers. It does not force every dirty prefix to S3 during shutdown; local files are already durable and the next startup will queue their checkpoints immediately. The memory adapter implements `close()` as a no-op.
+`openSegmentedOrderedRecordStore()` reconstructs and validates local files, queues locally dirty files for checkpointing, and returns when that local reconstruction is complete. It performs no S3 availability check, listing, or download during startup. `close()` rejects new work, waits for in-flight per-stream mutations and already-running S3 operations, flushes and closes local handles, and stops timers. It does not force every dirty file to S3 during shutdown; local files are already durable and the next startup will queue their checkpoints immediately. The memory adapter implements `close()` as a no-op.
 
 Remove from the target contract:
 
@@ -81,7 +81,7 @@ Remove from the target contract:
 - `IDEMPOTENCY_CONFLICT`;
 - `deleteStream()`.
 
-No MVP caller needs physical stream deletion. Removing it avoids specifying deletion across local active files, checkpoints, sealed objects, races, and partial failures before a real product requirement exists.
+No MVP caller needs physical stream deletion. Removing it avoids specifying deletion across local files, S3 segment objects, races, and partial failures before a real product requirement exists.
 
 Generate a UUIDv7 for every record using the maintained `uuid` package's `v7()` without an options argument so its timestamp-ID internal state is active. The segment ID is the UUIDv7 of its first record. A public record ID is the unpadded 43-character base64url encoding of 32 bytes:
 
@@ -89,7 +89,7 @@ Generate a UUIDv7 for every record using the maintained `uuid` package's `v7()` 
 16-byte record UUIDv7 || 16-byte segment UUIDv7
 ```
 
-Including the segment ID lets `beforeId` and `afterId` locate the exact active or sealed object without a manifest. `compareRecordIds()` validates and decodes both IDs, then compares the record-UUID half bytewise; callers never compare the base64url text directly. Generated record UUIDs must be strictly increasing within this one writer process, including multiple records in one millisecond; contract tests enforce that property.
+Including the segment ID lets `beforeId` and `afterId` locate the exact local or S3 segment without a manifest. `compareRecordIds()` validates and decodes both IDs, then compares the record-UUID half bytewise; callers never compare the base64url text directly. Generated record UUIDs must be strictly increasing within this one writer process, including multiple records in one millisecond; contract tests enforce that property.
 
 Per-record UUIDv7 is necessary because a segment can remain active for days. A new record in an old segment must still sort newer than records written yesterday to other streams. The host clock must remain NTP-synchronized; handling a clock that moves materially backward across a complete process restart is outside the MVP reliability model.
 
@@ -110,17 +110,17 @@ Successful append means:
 
 Only after step 3 may Messenger acknowledge or fan out the canonical send. `datasync()` is not used for this contract because Node documents that it does not flush modified metadata; the expected message rate does not justify weakening the simpler `sync()` rule. S3 is asynchronous and never delays the request path.
 
-Ordinary process or host-process crashes recover acknowledged records from the durable local volume. The active S3 checkpoint may lag local storage by up to approximately five minutes. That lag is an explicitly accepted loss window only if the local durable volume itself is catastrophically lost.
+Ordinary process or host-process crashes recover acknowledged records from the durable local volume. The newest S3 segment snapshot may lag local storage by up to approximately five minutes. That lag is an explicitly accepted loss window only if the local durable volume itself is catastrophically lost.
 
 Runtime S3 checkpoint failures do not make already fsynced local appends fail. They leave the segment dirty and trigger bounded retry with backoff. Operational visibility should report a growing checkpoint backlog without introducing an enterprise monitoring system.
 
 ## 5. Segment and record format
 
-Each active file belongs to one opaque stream and one unique active-segment generation. The segment ID is the UUIDv7 record ID of its first record; a segment is created only as part of its first append, so there are no empty segment files. The stream ID is present in the segment header so path hashes are not the only copy of identity.
+Each local file belongs to one opaque stream and one unique segment. The segment ID is the UUIDv7 record ID of its first record; a segment is created only as part of its first append, so there are no empty segment files. The stream ID is present in the segment header so path hashes are not the only copy of identity.
 
 Use a custom versioned envelope rather than Protobuf, CBOR, or MessagePack. Those encodings do not provide reverse framing, torn-tail detection, or S3 range-read boundaries, so they would still need the same outer format. The fixed envelope is small enough to implement and test directly, while caller data remains an opaque UTF-8 string.
 
-Version 1 is uncompressed. Future sealed segments may use other codecs without rewriting existing objects because the header identifies the format and codec.
+Version 1 is uncompressed. Future segments may use other codecs without rewriting existing objects because the header identifies the format and codec.
 
 All integers are unsigned big-endian. The version-1 segment header is:
 
@@ -149,142 +149,125 @@ N bytes   opaque payload UTF-8 bytes
 4 bytes   repeated body length
 ```
 
-The API renders the timestamp as UTC ISO-8601 with millisecond precision. The UUIDv7 timestamp and stored timestamp must agree. CRC32C is implemented in small package-owned TypeScript with published test vectors rather than adding a serialization framework. A sealed/checkpoint object additionally uses a whole-object SHA-256 supplied to S3 with `PutObject`; do not infer integrity from `ETag`.
+The API renders the timestamp as UTC ISO-8601 with millisecond precision. The UUIDv7 timestamp and stored timestamp must agree. CRC32C is implemented in small package-owned TypeScript with published test vectors rather than adding a serialization framework. Every uploaded segment snapshot additionally uses a whole-object SHA-256 supplied to S3 with `PutObject`; do not infer integrity from `ETag`.
 
-The store must not add sender, message type, buddy, or conversation fields. Leading length supports forward scan; trailing length supports reverse scan; the checksum detects torn or corrupt records. A segment footer is unnecessary in version 1 because the final valid record frame supplies the tail boundary and sealed-object metadata supplies byte length.
+The store must not add sender, message type, buddy, or conversation fields. Leading length supports forward scan; trailing length supports reverse scan; the checksum detects torn or corrupt records. A segment footer is unnecessary in version 1 because the final valid record frame supplies the tail boundary and S3 object metadata supplies byte length.
 
 An incomplete final record after a crash is truncated to the last valid frame. Middle-of-file corruption is an error/recovery condition, not silently skipped data.
 
-## 6. Rotation and dormancy
+## 6. Rotation and local residency
 
-An active segment is sealed under either condition:
+The newest segment of a stream is mutable whether or not it currently has a local copy. When rotation creates a newer segment, every earlier segment becomes immutable. There is no separate sealing operation or remote active-segment class.
 
-- after a complete append makes it approximately 256 KiB or larger; or
-- it has received no successful append for 14 days.
+Before appending a record, inspect the current local segment. If its valid length is already approximately 256 KiB or larger, the new record begins a new segment. Because the threshold is tested only between complete records, the prior segment may exceed the target by one record—even by 50 KiB or more. That is acceptable and simpler than splitting or preflighting payloads.
 
-The size is a target, not a hard boundary. Append the complete record and then test rotation. Overshoot by one record—even 50 KiB or more—is acceptable and simpler than splitting or preflighting payloads.
+A segment is created only with its first record. The first record's UUIDv7 is also the new segment ID, so rotation never creates an empty successor and never needs a sequence value from the previous segment.
 
-The idle condition measures time since the last successful append. Unlike checkpoint timing, every append moves the idle deadline. A simple hourly sweep of the in-memory active catalog is adequate; one operating-system timer per stream is unnecessary. Startup reads the last valid record timestamp and immediately seals any active segment already idle for 14 days.
+Fourteen days of append inactivity controls only local cache residency. A simple hourly sweep is sufficient; one timer per stream is unnecessary. A clean current local file with no successful append for 14 days may be deleted and removed from the in-memory catalog. In normal continuous operation it became clean roughly five minutes after its last append. A dirty-and-idle file is an exceptional recovery case after an unusually long process interruption or S3 outage; upload it successfully and mark it clean before deletion. If S3 is unavailable, retain it and retry rather than deleting acknowledged data.
 
-A sealed segment is immutable forever. After a successful seal, the stream becomes dormant and has no empty successor active segment. If a record arrives weeks or years later, create a brand-new independently identified active segment. Do not reopen, append to, inspect, or download the newest sealed segment merely to restart writing.
+When a later append finds no local file, it lazily locates the newest S3 object for that stream. If the listed object is below the rotation target, download and validate it as the clean local working file, then append. If it is already at or above the target, create a new segment without downloading the old object.
 
-This rule is essential to bounding startup work. Creating an empty active anchor after every idle seal would retain one active file/object per historical stream and defeat idle sealing.
+This local eviction rule bounds startup work to cached recent streams and any dirty backlog. It does not create extra small S3 objects merely because a conversation was idle.
 
-Segment and record identities therefore never require reading the previous segment to calculate a next sequence number. The first new UUIDv7 record becomes the new segment ID.
+## 7. Local dirty state and checkpoint scheduling
 
-## 7. Active checkpoint scheduling
+A local segment is either clean, meaning its complete valid bytes match the most recently successful S3 upload for that key, or dirty, meaning S3 may contain only an earlier prefix or no object yet. This bit must survive process failure; it is per-file recovery metadata, not a persisted stream catalog.
 
-An active segment has a checkpointed prefix length and a possibly longer local length.
+The initial implementation encodes the state in an atomically renamed filename suffix, for example `<segment-id>.clean.ors` and `<segment-id>.dirty.ors`. Before modifying a clean file, rename it to dirty and fsync the parent directory. Only then append and `FileHandle.sync()` the complete record. A new segment is installed as dirty with both its file and directory entry durably flushed as part of its first append. A segment downloaded from S3 is installed as clean through a validated, fsynced temporary file and atomic rename before it can be modified.
 
 Checkpoint scheduling follows audit-time behavior:
 
 1. The first append that makes a clean segment dirty sets a deadline five minutes later.
 2. Later appends before that deadline do not move it.
-3. At the deadline, capture the current byte length, last included record ID, and checksum needed by the upload operation.
-4. Upload exactly that captured prefix while later local appends may continue.
-5. The first append after capture begins the next five-minute window, even if the prior upload is still completing.
-6. A failed upload keeps the captured prefix dirty and retries it with backoff; failure does not restart a fresh five-minute grace period.
+3. At the deadline, capture the current valid byte length and whole-prefix checksum.
+4. Upload exactly that captured prefix to the segment's stable S3 key while later local appends may continue.
+5. If no later bytes were appended, atomically rename the local file clean and fsync its parent directory. If the file grew, leave it dirty and let the first append after capture establish the next five-minute window.
+6. A failed upload leaves the file dirty and retries with backoff; failure does not grant a fresh five-minute grace period.
 
-Only one checkpoint upload for a segment needs to run at a time. A later due checkpoint may coalesce to the newest safe prefix once the prior operation settles.
+Only one upload for a particular segment may run at a time. A later due checkpoint may coalesce to the newest safe prefix after the earlier operation settles. This prevents an older upload from completing after a newer upload and regressing the S3 object.
 
-If the segment reaches a seal condition before its checkpoint deadline, cancel the ordinary checkpoint and seal/upload the full segment immediately.
+When rotation makes a segment noncurrent, queue its final full upload immediately. The new segment may accept local appends while that upload runs. Delete the old local file only after its final upload succeeds and its state is clean; retain it through any S3 outage.
 
-The S3 checkpoint object for one active-segment generation is overwritten at a stable generation-specific key. Object replacement must never expose a partial object. Each new active generation uses a new key so a stale checkpoint with coincidentally equal length cannot be mistaken for the new file.
+S3 publication remains ordered per stream: the final upload of an older segment must succeed before the first upload of the newer segment. Local appends to the newer file do not wait. This prevents newest-first discovery from exposing a newer S3 segment while its immediate predecessor is still absent. After a restart, upload multiple dirty files for one stream from oldest to newest.
 
-## 8. S3 layout and sealing
+S3 `PutObject` replaces the entire object at the stable segment key. It is not an in-place append. Object replacement must expose either the old complete prefix or the new complete prefix, never a partial object.
 
-For an opaque UTF-8 stream ID, calculate lowercase hexadecimal `SHA-256(streamId)`. Use its first two hex characters as the shard and the remaining 62 as the stream directory. UUID values in paths are lowercase 32-character hex without hyphens. The key layout is:
+## 8. S3 layout and segment publication
+
+For an opaque UTF-8 stream ID, calculate lowercase hexadecimal `SHA-256(streamId)`. Use its first two hex characters as the shard and the remaining 62 as the stream directory. UUID values in paths are lowercase 32-character hex without hyphens. There is one S3 namespace:
 
 ```text
-active/v1/<shard>/<remaining-stream-hash>/<segment-id>.ors
 segments/v1/<shard>/<remaining-stream-hash>/<inverted-segment-id>-<segment-id>.ors
 ```
 
-`inverted-segment-id` is the lowercase hex encoding of the bitwise complement of the 16 segment-ID bytes. A general-purpose S3 bucket lists keys lexicographically, so the newest segment sorts first and `MaxKeys=1` finds it. Directory/S3 Express buckets are not supported because they do not provide this ordering. A cursor contains the original segment ID, so its exact sealed key is derivable without listing.
+There is deliberately no `active/v1/` prefix. The current segment's object is overwritten by periodic snapshots. After a newer segment is created, the older object's final successful upload is immutable by rule.
+
+`inverted-segment-id` is the lowercase hex encoding of the bitwise complement of the 16 segment-ID bytes. A general-purpose S3 bucket lists keys lexicographically, so the newest segment sorts first and a stream-specific `ListObjectsV2` with `MaxKeys=1` finds it. Directory/S3 Express buckets are not supported because they do not provide this ordering. A cursor contains the original segment ID, so its exact object key is derivable without listing.
 
 The path hash avoids exposing caller identifiers and produces safe bounded keys. The segment header retains the original stream ID and detects collisions or misplaced files.
 
 Key-format invariants:
 
-- every active generation has a unique identity;
-- checkpoints for that generation overwrite only its own active key;
-- sealed keys are immutable and deterministic enough that retrying an uncertain seal is safe;
-- sealed objects for one stream list newest-first, allowing the latest sealed segment to be found without listing the stream's entire history;
-- a record cursor identifies its segment, allowing older-page lookup without a separate manifest.
+- every segment has a unique stable identity and one S3 key;
+- periodic snapshots overwrite only that segment's key;
+- an older segment is never modified after a newer segment exists;
+- segments for one stream list newest-first without enumerating the stream's entire history;
+- a record cursor identifies its segment, allowing exact lookup without a manifest.
 
-Seal under the stream's serialized operation queue:
+The bucket dedicated to this store has versioning disabled so periodic overwrites do not retain an unbounded chain of noncurrent checkpoint objects. Segment objects may use Standard or an immediately readable class such as Standard-IA. They must never transition to Glacier or another storage class that requires a restore before `GetObject`. Current objects are not expired by lifecycle policy.
 
-1. close/capture the complete valid local segment;
-2. upload it to its deterministic immutable sealed key;
-3. verify the completed upload using a whole-segment checksum;
-4. delete the matching S3 active checkpoint;
-5. delete the local active file; version 1 has no sealed local cache;
-6. remove the stream from the active runtime catalog.
-
-If upload completion is uncertain, repeating the immutable upload with identical bytes is safe. Delete neither the active checkpoint nor the local active file until the sealed object is verified.
-
-Deleting the active checkpoint before the local file ensures an ordinary crash cannot leave an S3-only active segment during sealing. A crash after checkpoint deletion but before local deletion can cause the local file to be rediscovered; because it is already at the size/idle seal condition and the sealed key is deterministic, startup safely repeats the seal and cleanup.
-
-Active checkpoints remain in S3 Standard. The recommended versioning and sealed-object lifecycle policy is recorded in section 15; it is deployment policy rather than part of the record API.
-
-## 9. No manifest and no persisted catalog
+## 9. No manifest or persisted catalog
 
 There is intentionally:
 
 - no per-stream manifest;
 - no persisted runtime catalog;
-- no dirty-marker sidecar.
+- no remote active-segment prefix or global active-frontier index.
 
-At runtime an in-memory catalog tracks active file handles, lengths, last records, last-append times, checkpoint state, and per-stream serialization. The catalog is disposable and rebuilt on every process start.
+There is a durable clean/dirty state beside each local segment, encoded in its filename. That state answers only whether the local bytes need uploading; it does not enumerate remote streams or record stream history.
 
-Only the active frontier is rebuilt eagerly. Sealed archives are never enumerated globally at startup. They are discovered lazily for one stream when a read crosses into sealed history or asks for the latest record of a dormant stream.
+At runtime an in-memory catalog tracks locally resident files, their lengths and last records, last-append times, checkpoint state, and per-stream serialization. The catalog is disposable and rebuilt from local files on every process start. It is intentionally not a complete catalog of streams in S3.
 
-Idle sealing makes startup work proportional to streams used within roughly the last 14 days, rather than every stream ever created. A stream kept active by a recent append may still contain older records, but every active segment remains bounded to approximately the rotation target plus one record.
+Nonlocal segments are never enumerated globally at startup. They are discovered lazily for one stream when a read crosses into nonlocal history, `getLatest()` needs a nonlocal head, or an append has no local working file.
 
-Persisting a catalog would not remove the need to reconcile it with local files after an unclean shutdown. It would create another crash-consistency protocol while saving limited work once idle sealing bounds the frontier.
+Persisting a full catalog would create another crash-consistency protocol without eliminating local-file inspection. The filename-level dirty bit is the only persisted runtime state required by this design.
 
-## 10. Startup reconstruction and reconciliation
+## 10. Startup reconstruction
 
-The durable store must finish active-frontier reconstruction before Messenger advertises readiness. Failure to complete the full S3 `active/` listing, or any required exceptional checkpoint restore, makes `openSegmentedOrderedRecordStore()` reject. The Messenger composition root logs a content-free operational error and exits nonzero; its process supervisor may retry later. There is no startup degraded mode.
+Startup is local-only and performs:
 
-Startup performs:
+1. Enumerate every local clean and dirty segment file.
+2. Validate its header and framed records. Truncate an incomplete final frame only in a dirty file. An invalid clean cache file is never uploaded; remove or quarantine it so its S3 object can be rediscovered lazily. Middle-of-file corruption remains an explicit recovery error.
+3. Rebuild catalog entries for the local working set and identify the newest local segment per stream.
+4. Queue every dirty file for immediate upload rather than granting a new five-minute grace period.
+5. Delete any clean noncurrent local segment, and queue final upload then cleanup for a dirty noncurrent segment left by a crash or prior S3 outage.
+6. Evict clean current files already idle for 14 days.
 
-1. Enumerate every local active file.
-2. Validate its header and framed records; truncate an incomplete final frame.
-3. Rebuild each local active catalog entry, including valid byte length and last-append time.
-4. Perform paginated S3 listing of the complete `active/` prefix.
-5. Build a remote map from unique active-segment key to listed object size.
-6. Reconcile the union of local and remote generations.
-7. Queue dirty generations immediately rather than granting a new five-minute grace period.
-8. Immediately seal generations already over the size target or idle for 14 days.
+`openSegmentedOrderedRecordStore()` returns after this local reconstruction. Readiness performs no S3 availability probe, list, head, or download and succeeds while S3 is unavailable. Queued dirty uploads are ordinary asynchronous runtime work and may begin immediately, but opening does not wait for them. Operations that can be satisfied from local files continue; an operation that needs a nonlocal segment fails normally if S3 cannot provide it.
 
-Normal reconciliation needs S3 listing metadata only. It does not download every active checkpoint and does not rely on `ETag` as a universal content checksum.
+The store trusts a clean local marker under the single-writer invariant. It does not compare every clean file with S3 during startup. Restoring the local data directory to an older snapshot while retaining newer S3 state is outside the MVP recovery model because a stale local file could overwrite a newer remote prefix. After total local-volume loss or deliberate rollback, discard the local working set and let streams rehydrate lazily from S3.
 
-| Local state | Listed S3 active state | Startup action |
-| --- | --- | --- |
-| Same generation and same byte length | Present | Treat as clean after local frame validation |
-| Local file is longer | Shorter object | Treat as dirty; checkpoint immediately |
-| Local file exists | No object | Treat as dirty; checkpoint immediately |
-| No local file | Object exists | Exceptional recovery: download and restore it |
-| Local file is shorter | Longer object | Exceptional recovery: download/restore the remote prefix |
+## 11. Reads and lazy segment discovery
 
-The equal-length case relies on the single-writer invariant and the rule that an active checkpoint is always an exact prefix of that same uniquely identified local generation. Local frame checks detect ordinary torn/corrupt tails. A separate full remote-byte verification on every restart is unnecessary; the upload was checksummed when written.
+Local files support forward and reverse scan through their framing. Nonlocal version-1 objects remain uncompressed so the durable adapter can use range reads near the object tail rather than download an entire segment merely to return a recent page.
 
-Remote-only or remote-longer cases should not occur on an ordinary restart with the same durable local volume. They cover catastrophic local loss, replaced storage, or corruption and are the only startup cases that require checkpoint downloads.
+For an append with no local working file, serialize the stream operation and issue a newest-first `ListObjectsV2` for that stream with `MaxKeys=1`:
 
-If the service was offline for more than 14 days, its first restart may discover and seal many old active segments once. Subsequent startups benefit from the bounded frontier.
+- if no object exists, create a new dirty local segment with the appended record;
+- if the newest object's listed size is at or above the rotation target, create a new dirty local segment without downloading it;
+- otherwise download the whole newest segment, validate and install it as clean locally, then mark it dirty and append.
 
-## 11. Reads and lazy archive discovery
+Downloading the whole object on the last path is intentional: the segment is only approximately 256 KiB, and its next checkpoint must upload a complete replacement object. Concurrent cache-miss work and all later mutations for that stream use the same per-stream serialization.
 
-Active files support forward scan and reverse scan through their framing. Sealed version-1 objects remain uncompressed so the durable adapter can use range reads near the object tail rather than download an entire segment merely to return a recent page.
+A read or `getLatest()` uses the local newest segment when present. Otherwise it performs the same one-object newest-first listing and range-reads the returned object's tail. Reading does not need to install a full local working copy.
 
-For a dormant stream, `append()` creates a new active generation without consulting S3. A read or `getLatest()` independently lists that stream's sealed prefix with `MaxKeys=1`, range-reads the returned object's tail, and caches the result in memory.
+A `beforeId` or `afterId` cursor contains its segment UUID, so the store derives the exact local or S3 key directly. When backward pagination exhausts that segment, one newest-first prefix listing starting after its inverted segment key finds the immediately older segment. It does not enumerate the stream's entire history.
 
-A `beforeId` or `afterId` cursor contains its segment UUID, so the store derives the exact active and sealed keys directly. When backward pagination exhausts that segment, one newest-first prefix listing starting after its inverted segment key finds the immediately older sealed segment. It does not enumerate the stream's entire history.
+Optional per-segment offset indexes or read caches may be introduced only after measuring performance. They are not required for the initial approximately 256 KiB segments.
 
-Optional per-segment offset indexes or local sealed caches may be introduced only after measuring read performance. They are not required for the initial approximately 256 KiB segments.
+`getLatest(streamIds)` for many nonlocal streams may translate into several lazy S3 lookups. For the MVP, perform them with bounded concurrency and do not add a conversation-head table or generic global manifest. Measure real snapshot latency before adding another projection.
 
-`getLatest(streamIds)` for many dormant streams may translate into several lazy S3 lookups. For the MVP, perform them with bounded concurrency and do not add a conversation-head table or generic global manifest. Measure real snapshot latency before adding another projection.
+If S3 is unavailable, cached local appends and reads continue. A cache-miss append or read that requires a nonlocal segment fails so the consuming application can present its ordinary temporary-failure behavior.
 
 ## 12. Duplicate handling
 
@@ -298,16 +281,17 @@ The browser should not automatically retry uncertain sends. Realtime client dedu
 
 ## 13. Failure and concurrency boundaries
 
-- One process owns the local store and S3 active namespace at a time.
-- Appends and seal/checkpoint state transitions are serialized per stream.
-- Different streams may append and checkpoint concurrently with bounded concurrency.
-- A process crash may leave a partial local tail; startup truncates it.
-- A process crash during an active checkpoint leaves either the old or new complete S3 object; local length determines whether another checkpoint is needed.
-- A process crash during sealing safely retries the deterministic immutable upload and cleanup.
-- Local durable-volume loss restores active prefixes from S3 and may lose the accepted five-minute tail.
-- Sealed archive loss is outside the module's ordinary recovery model and is handled through S3 durability/versioning/backup policy.
-- S3 unavailability during normal runtime leaves local segments dirty and retrying; already-fsynced local appends may continue while disk capacity remains.
-- If the process restarts while S3 remains unavailable, startup fails and the process exits. This simple fail-closed rule prevents serving from an unreconciled active frontier.
+- Exactly one process/service instance owns the local store and S3 prefix. Multiple writers and distributed ownership are not supported.
+- Appends, rotation decisions, local state changes, and checkpoint scheduling are serialized per stream. Different streams may operate concurrently with bounded S3 concurrency.
+- At most one PUT per segment may be in flight, and different segments for one stream are first published oldest-to-newest, so remote history cannot expose a newer segment while its predecessor is absent.
+- A process crash may leave a partial tail in a dirty local file; startup truncates it and keeps the file dirty. An invalid clean cache file is discarded or quarantined rather than overwriting its authoritative S3 object.
+- A process crash during `PutObject` leaves either the old or new complete S3 object. The durable dirty marker causes a safe repeat upload when completion was not recorded locally.
+- A crash after a successful PUT but before the clean rename also causes only a redundant upload.
+- Catastrophic local-volume loss may lose the accepted tail since the last successful checkpoint. Streams and their last uploaded segment are rediscovered lazily from S3.
+- Restoring an old local-volume snapshot over newer S3 objects is unsupported. Discard an intentionally rolled-back cache instead of allowing stale local files to overwrite S3.
+- S3 unavailability during normal runtime leaves local files dirty and retrying; already-fsynced appends to cached streams may continue while disk capacity remains.
+- Startup itself does not contact S3 and therefore does not fail merely because S3 is unavailable. Cache-miss operations that require S3 fail until it recovers.
+- Loss of S3 segment objects is outside the module's ordinary recovery model and belongs to bucket durability and external backup policy.
 
 ## 14. Initial implementation sequence
 
@@ -315,26 +299,26 @@ The browser should not automatically retry uncertain sends. Realtime client dedu
 2. Revise Messenger payload/deduplication assumptions and move private read positions to compact Messenger-owned MySQL state.
 3. Implement the documented record IDs/cursors, binary layout, segment IDs, key layout, and async open/close shape as contract tests.
 4. Implement and exhaustively test binary framing, reverse scans, checksum validation, and torn-tail recovery without S3.
-5. Implement the local durable adapter with per-stream serialization, fsynced append, size rotation, and idle sweep.
-6. Inject an object-store boundary and test checkpoint audit timing, captured-prefix uploads, retries, and deterministic sealing against a fake implementation.
-7. Add the S3 implementation, full active-prefix listing reconciliation, exceptional downloads, and lazy sealed range reads.
+5. Implement the local durable adapter with per-stream serialization, durable clean/dirty filenames, fsynced append, size rotation, and idle cache eviction.
+6. Inject an object-store boundary and test checkpoint audit timing, captured-prefix uploads, retries, final rotated-segment upload, and clean-only eviction against a fake implementation.
+7. Add the S3 implementation, newest-segment discovery, cache-miss download/reactivation, lazy range reads, and local-only startup.
 8. Run the same behavior suite against memory and durable adapters plus restart/fault tests.
-9. Integrate the durable adapter into Messenger, gate broker readiness on reconstruction, and rehearse restart/offline-history behavior.
-10. Document local volume, S3 bucket/lifecycle/versioning, recovery, and deployment configuration before production cutover.
+9. Integrate the durable adapter into Messenger, gate broker readiness on local reconstruction, and rehearse restart/offline-history behavior.
+10. Document local volume, S3 bucket/lifecycle, recovery, and deployment configuration before production cutover.
 
 ## 15. Recommended implementation defaults
 
-The startup-failure and binary-format choices above were explicitly accepted on 2026-09-03. Treat the remaining recommendations below as implementation defaults unless later evidence causes a deliberate revision:
+The binary format and single-prefix mutable-latest design above were explicitly accepted by 2026-09-04. Treat the remaining recommendations below as implementation defaults unless later evidence causes a deliberate revision:
 
-- **Object-store boundary:** define a small internal interface for list, put, range/full get, head, and delete. Test it with an in-memory fake. The production implementation wraps an injected AWS SDK v3 `S3Client`; credentials and region remain composition-root concerns.
-- **S3 concurrency:** use one configurable limiter with a default of four in-flight object operations. Prioritize seal/checkpoint writes over user-triggered archive reads. The active-prefix startup listing remains sequentially paginated.
+- **Object-store boundary:** define a small internal interface for list, put, and range/full get. Test it with an in-memory fake. The production implementation wraps an injected AWS SDK v3 `S3Client`; credentials and region remain composition-root concerns.
+- **S3 concurrency:** use one configurable limiter with a default of four in-flight object operations. Prioritize dirty/final segment uploads over user-triggered nonlocal reads. Serialize uploads per segment.
 - **Bucket kind:** require a general-purpose S3 bucket. The newest-first key design relies on lexicographical `ListObjectsV2` ordering and therefore does not support S3 Express directory buckets.
-- **Local volume:** require an explicit absolute data-directory path on persistent local SSD/block storage. Do not silently use the process working directory, `/tmp`, a container layer, or NFS. Store version-1 active files under `<dataDirectory>/v1/active/<shard>/<stream-hash>/<segment-id>.ors`.
-- **Disk capacity:** begin with at least 10 GiB for the active volume and an ordinary host disk-space alarm. The store reports checkpoint backlog and free-space diagnostics, but it does not build an automatic eviction system. `ENOSPC` fails append rather than acknowledging an unflushed record.
-- **Sealed local cache:** none for the MVP. Delete the local active file after the immutable sealed upload is verified and the active checkpoint is removed. Use S3 range reads; add a bounded cache only after measured latency justifies it.
+- **Local volume:** require an explicit absolute data-directory path on persistent local SSD/block storage. Do not silently use the process working directory, `/tmp`, a container layer, or NFS. Store version-1 files under `<dataDirectory>/v1/segments/<shard>/<stream-hash>/<segment-id>.clean.ors` or `<segment-id>.dirty.ors`.
+- **Disk capacity:** begin with at least 10 GiB for the local working set and an ordinary host disk-space alarm. Evict clean current files after 14 idle days and delete clean noncurrent files after final upload. Retain dirty files until upload succeeds. `ENOSPC` fails append rather than acknowledging an unflushed record.
+- **Local segment cache:** retain the current below-target segment while active. After 14 days without append, evict it if clean; the dirty-and-idle case is exceptional and must finish uploading before eviction. Use S3 range reads for ordinary nonlocal history and download a whole below-target newest segment only when a new append needs to continue it.
 - **Private read state:** move Messenger read positions to one mutable MySQL row per directional `(accountId, buddyId)` pair. This is compact current state, not append-only history, and does not belong in tiny ordered-record streams.
-- **Conversation-head projection:** do not add one initially. Use bounded lazy `getLatest()` S3 lookups for dormant conversations and measure snapshot latency before accepting dual-write/projection complexity.
-- **S3 versioning/lifecycle:** use bucket versioning. Keep current `active/` objects in Standard and expire their noncurrent versions after one day. Keep current `segments/` objects in Standard for 30 days, then transition them to Standard-IA; expire noncurrent sealed-object versions after 30 days. Never expire current sealed objects. Clean expired delete markers.
+- **Conversation-head projection:** do not add one initially. Use bounded lazy `getLatest()` S3 lookups for nonlocal conversations and measure snapshot latency before accepting dual-write/projection complexity.
+- **S3 versioning/lifecycle:** use a dedicated bucket with versioning disabled for this store. Keep segment objects indefinitely. Standard is sufficient; an optional transition to Standard-IA is allowed because reads remain immediate. Never transition these objects to Glacier or any restore-required archival tier.
 - **Object integrity:** use single-request `PutObject` with a supplied full-object SHA-256 for these sub-megabyte objects. Do not use multipart upload and do not treat `ETag` as a checksum.
 - **Package deployment:** during the solo-development phase, depend on an exact Git commit SHA so deployments are reproducible without adding a package-release workflow. Publish a normal semver npm package only when another consumer or release process makes that worthwhile.
 
@@ -354,7 +338,7 @@ The startup-failure and binary-format choices above were explicitly accepted on 
 ## 17. Resume instructions
 
 1. Read this document completely and then `README.md`.
-2. Read `diepkhuc-messenger/docs/MVP-CONTRACT.md`, especially its storage mapping and current implementation status.
+2. Read `../../../DiepKhucProjects/apsvc-diepkhuc-messenger/docs/MVP-CONTRACT.md`, especially its storage mapping and current implementation status.
 3. Inspect `src/index.ts` and its tests, remembering that they implement the older draft API.
 4. Inspect how `apsvc-diepkhuc-messenger` currently uses idempotency, decimal IDs, `getLatest()`, and read-position streams.
 5. Start with the section 15 defaults and record any deliberate revision here before relying on it in code.

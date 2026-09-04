@@ -10,15 +10,15 @@ The durable design is a **working design, not a frozen contract**. The only chec
 
 All memory-store records disappear when the process exits. Do not deploy it as production persistence.
 
-The intended production adapter stores active segments on durable local storage and archives/checkpoints them to S3:
+The intended production adapter uses durable local working segments as a write-back cache over one S3 segment namespace:
 
 ```text
 append opaque record
-  -> append complete framed record to local active segment
+  -> append complete framed record to local working segment
   -> durably flush local file
   -> acknowledge caller
-  -> checkpoint dirty active prefix to S3 after at most about five minutes
-  -> seal to immutable S3 object at about 256 KiB or after 14 idle days
+  -> overwrite that segment's S3 object after at most about five minutes
+  -> rotate near 256 KiB; after 14 idle days evict a clean local copy
 ```
 
 S3 is never on the synchronous append path. The design accepts up to roughly five minutes of loss only when the local durable volume itself is catastrophically lost.
@@ -42,19 +42,19 @@ It is expected to remove:
 
 The store does not permanently deduplicate caller requests. A consuming application may perform cheap, domain-aware best-effort duplicate suppression at the stream head. Rare duplicates are preferable here to a durable side index and its recovery rules.
 
-The durable design uses per-record UUIDv7 values internally. Its public 43-character base64url cursor contains both the record UUID and its segment UUID, allowing exact segment lookup without a manifest. Consumers still treat the value as opaque and use `compareRecordIds()` rather than relying on the memory adapter's current decimal IDs. The async durable factory returns only after startup reconciliation; startup fails if S3 cannot be fully reconciled.
+The durable design uses per-record UUIDv7 values internally. Its public 43-character base64url cursor contains both the record UUID and its segment UUID, allowing exact segment lookup without a manifest. Consumers still treat the value as opaque and use `compareRecordIds()` rather than relying on the memory adapter's current decimal IDs. The async durable factory reconstructs local files only and performs no S3 availability check at startup.
 
 ## Segment lifecycle summary
 
-- One active segment generation exists only while a stream is active.
-- Append complete records and rotate after the resulting file reaches approximately 256 KiB; overshoot by one record is fine.
-- Also seal after 14 days without a successful append.
-- Sealed segments are immutable.
-- A later append to a dormant stream creates a new independently identified active segment. It does not unseal or download the previous segment.
-- The first append that makes a clean active segment dirty sets a five-minute checkpoint deadline. Later appends do not move it.
-- No per-stream manifest, persisted catalog, or dirty-marker file is maintained.
-- Startup rebuilds the in-memory catalog from the complete active frontier, but sealed history remains lazy.
-- Normal startup performs local file inspection plus paginated S3 listing and size reconciliation. It does not download every active checkpoint.
+- The newest segment is mutable; older segments become immutable when rotation creates a newer segment.
+- Before appending, rotate when the current segment is approximately 256 KiB or larger; overshoot by one complete record is fine.
+- The first append that makes a clean local segment dirty sets a five-minute checkpoint deadline. Later appends do not move it.
+- A durable per-file clean/dirty bit lets startup recover unsynced-to-S3 local bytes without a persisted catalog or remote active namespace.
+- If no local file exists, locate the newest S3 segment with one newest-first listing. Download it when it is below the rotation target; otherwise create a new segment.
+- After 14 days without a successful append, evict the normally clean local copy. A dirty-and-idle file is an exceptional long-outage recovery case and must upload successfully before eviction. This is cache eviction, not sealing.
+- Startup validates local files, reconstructs only the local working set, and queues dirty uploads. It performs no S3 probe, listing, or download.
+- The MVP assumes exactly one store/service instance.
+- The bucket has versioning disabled and never transitions segment objects to Glacier or another restore-required storage class.
 - Version 1 uses a small custom big-endian binary frame with leading/trailing lengths and CRC32C, plus SHA-256 for each S3 upload; it does not use Protobuf.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the complete recovery cases, decisions, open questions, and implementation sequence.
