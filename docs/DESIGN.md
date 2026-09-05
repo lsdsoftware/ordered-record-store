@@ -218,7 +218,7 @@ Key-format invariants:
 - segments for one stream list newest-first without enumerating the stream's entire history;
 - a record cursor identifies its segment, allowing exact lookup without a manifest.
 
-The bucket dedicated to this store has versioning disabled so periodic overwrites do not retain an unbounded chain of noncurrent checkpoint objects. Segment objects may use Standard or an immediately readable class such as Standard-IA. They must never transition to Glacier or another storage class that requires a restore before `GetObject`. Current objects are not expired by lifecycle policy.
+The store owns a dedicated key prefix even when its bucket is shared. The DiepKhuc deployment uses `s3://diepkhuc-usercontent/messenger/`; bucket versioning is disabled so periodic overwrites do not retain an unbounded chain of noncurrent checkpoint objects. A prefix-scoped lifecycle transitions eligible objects to Standard-IA after 30 days, while the bucket default leaves objects smaller than 128 KiB in Standard. Current objects are never expired or transitioned to Glacier or another class that requires a restore before `GetObject`.
 
 ## 9. No manifest or persisted catalog
 
@@ -312,9 +312,9 @@ positions, composition-root selection, and restart test are implemented in the
 consuming backend. Remaining work is deployment-specific:
 
 1. Create the Messenger read-position table in the deployment database.
-2. Provision the dedicated bucket and persistent local data directory.
-3. Choose a reproducible package reference instead of the development `file:`
-   dependency.
+2. Provision the persistent local data directory and configure the deployed
+   `diepkhuc-usercontent` bucket with the dedicated `messenger/` prefix.
+3. Use the published versioned npm package.
 4. Rehearse the service against the real development broker, database, local
    volume, and bucket, including restart and temporary S3 failure.
 5. Configure disk/backlog visibility and write the final operator recovery notes
@@ -332,9 +332,9 @@ The binary format and single-prefix mutable-latest design above were explicitly 
 - **Segment caches:** retain the current below-target segment locally while active. After 14 days without append, evict it if clean; the dirty-and-idle case is exceptional and must finish uploading before eviction. Fetch complete nonlocal objects and keep at most 64 in a disposable in-memory LRU so continued pagination does not repeat `GetObject` for the same segment.
 - **Private read state:** move Messenger read positions to one mutable MySQL row per directional `(accountId, buddyId)` pair. This is compact current state, not append-only history, and does not belong in tiny ordered-record streams.
 - **Conversation-head projection:** do not add one initially. Use bounded lazy `getLatest()` S3 lookups for nonlocal conversations and measure snapshot latency before accepting dual-write/projection complexity.
-- **S3 versioning/lifecycle:** use a dedicated bucket with versioning disabled for this store. Keep segment objects indefinitely. Standard is sufficient; an optional transition to Standard-IA is allowed because reads remain immediate. Never transition these objects to Glacier or any restore-required archival tier.
+- **S3 versioning/lifecycle:** use a dedicated prefix in a versioning-disabled general-purpose bucket. The DiepKhuc deployment uses `diepkhuc-usercontent/messenger/` and transitions eligible objects to Standard-IA after 30 days. Keep segment objects indefinitely and never transition them to Glacier or any restore-required archival tier.
 - **Object integrity:** use single-request `PutObject` with a supplied full-object SHA-256 for these sub-megabyte objects. Do not use multipart upload and do not treat `ETag` as a checksum.
-- **Package deployment:** during the solo-development phase, depend on an exact Git commit SHA so deployments are reproducible without adding a package-release workflow. Publish a normal semver npm package only when another consumer or release process makes that worthwhile.
+- **Package deployment:** consume the published package through an explicit semver dependency and retain its lockfile resolution for reproducible deployments.
 
 ## 16. Explicit non-goals
 

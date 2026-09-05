@@ -52,7 +52,7 @@ The durable design uses per-record UUIDv7 values internally. Its public 43-chara
 - Startup validates local files, reconstructs only the local working set, and queues dirty uploads. It performs no S3 probe, listing, or download.
 - Nonlocal segments are fetched as complete objects and retained in a disposable 64-segment in-memory LRU, avoiding repeat `GetObject` calls during continued pagination.
 - The MVP assumes exactly one store/service instance.
-- The bucket has versioning disabled and never transitions segment objects to Glacier or another restore-required storage class.
+- The DiepKhuc deployment uses the versioning-disabled shared `diepkhuc-usercontent` bucket under `messenger/`. A prefix-scoped lifecycle moves eligible objects to Standard-IA after 30 days and never expires or archives them to a restore-required class.
 - Version 1 uses a small custom big-endian binary frame with leading/trailing lengths and CRC32C, plus SHA-256 for each S3 upload; it does not use Protobuf.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the complete recovery cases, decisions, open questions, and implementation sequence.
@@ -103,4 +103,4 @@ npm test
 npm run build
 ```
 
-The package is already consumed by `apsvc-diepkhuc-messenger` through a local `file:` dependency. Publishing or pinning a reproducible package version remains deployment work.
+The package is published and consumed by `apsvc-diepkhuc-messenger` as a versioned npm dependency.
