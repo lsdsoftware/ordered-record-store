@@ -546,3 +546,191 @@ function deferred() {
 function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds))
 }
+
+describe('bounded discovery metadata', () => {
+  async function open(t, objects = new FakeObjectStore(), options = {}) {
+    const directory = await mkdtemp(path.join(tmpdir(), 'ors-discovery-'))
+    const store = await openSegmentedOrderedRecordStore({
+      dataDirectory: directory, objectStore: objects,
+      checkpointDelayMilliseconds: 60_000, ...options,
+    })
+    t.after(async () => { await store.close(); await rm(directory, {recursive: true, force: true}) })
+    return {store, objects, directory}
+  }
+
+  test('shares absent heads across latest/read/append and knows both ends of new streams', async t => {
+    const {store, objects} = await open(t)
+    assert.equal((await store.getLatest(['s'])).get('s'), null)
+    for (let i = 0; i < 3; i++) assert.deepEqual(await store.read({streamId: 's', limit: 50}), [])
+    const first = await store.append({streamId: 's', data: 'first'})
+    const second = await store.append({streamId: 's', data: 'second'})
+    assert.equal(objects.listCalls, 1)
+    for (let i = 0; i < 3; i++) {
+      assert.deepEqual(await store.read({streamId: 's', afterId: second.id, limit: 1000}), [])
+      assert.deepEqual(await store.read({streamId: 's', afterId: first.id, limit: 1000}), [second])
+      assert.deepEqual(await store.read({streamId: 's', beforeId: first.id, limit: 1}), [])
+      assert.deepEqual(await store.read({streamId: 's', limit: 50}), [first, second])
+    }
+    assert.equal(objects.listCalls, 1)
+    const foreign = await store.append({streamId: 'other', data: 'foreign'})
+    await assert.rejects(store.read({streamId: 's', afterId: foreign.id, limit: 1}), error => error.code === 'INVALID_ARGUMENT')
+  })
+
+  test('shares remote head discovery with reads and append, and retains the oldest boundary', async t => {
+    const objects = new FakeObjectStore()
+    const [first] = await seedSegments(objects, 's', 1)
+    const {store} = await open(t, objects)
+    assert.equal((await store.getLatest(['s'])).get('s').id, first.id)
+    for (let i = 0; i < 3; i++) {
+      assert.equal((await store.read({streamId: 's', limit: 1}))[0].id, first.id)
+      assert.deepEqual(await store.read({streamId: 's', afterId: first.id, limit: 1000}), [])
+    }
+    assert.equal(objects.listCalls, 1)
+    await store.read({streamId: 's', limit: 50})
+    assert.equal(objects.listCalls, 2, 'first oldest-boundary discovery')
+    for (let i = 0; i < 3; i++) await store.read({streamId: 's', limit: 50})
+    const second = await store.append({streamId: 's', data: 'second'})
+    assert.equal(objects.listCalls, 2)
+    assert.equal((await store.getLatest(['s'])).get('s').id, second.id)
+  })
+
+  test('one page supplies reusable remote links in both directions', async t => {
+    const objects = new FakeObjectStore()
+    const records = await seedSegments(objects, 's', 3)
+    const {store} = await open(t, objects)
+    for (let i = 0; i < 3; i++) {
+      const newer = await store.read({streamId: 's', afterId: records[0].id, limit: 1000})
+      assert.deepEqual(newer.map(r => r.id), records.slice(1).map(r => r.id))
+      const all = await store.read({streamId: 's', limit: 1000})
+      assert.deepEqual(all.map(r => r.id), records.map(r => r.id))
+    }
+    assert.equal(objects.listCalls, 1)
+  })
+
+  test('retains links across listing pages without assuming arbitrary cached segments are adjacent', async t => {
+    const objects = new FakeObjectStore()
+    const records = await seedSegments(objects, 's', 1002)
+    const {store} = await open(t, objects)
+    const result = await store.read({streamId: 's', afterId: records[0].id, limit: 1000})
+    assert.deepEqual(result.map(r => r.id), records.slice(1, 1001).map(r => r.id))
+    assert.equal(objects.listCalls, 2)
+    const repeated = await store.read({streamId: 's', afterId: records[0].id, limit: 1000})
+    assert.deepEqual(repeated.map(r => r.id), result.map(r => r.id))
+    assert.deepEqual((await store.read({streamId: 's', afterId: records[1000].id, limit: 1000})).map(r => r.id), [records[1001].id])
+    assert.equal(objects.listCalls, 2)
+  })
+
+  test('head eviction rediscovers safely and failed discovery does not cache absence', async t => {
+    const {store, objects} = await open(t)
+    await store.getLatest(['first'])
+    for (let i = 0; i < 1024; i++) await store.getLatest([`empty-${i}`])
+    const before = objects.listCalls
+    await store.getLatest(['first'])
+    assert.equal(objects.listCalls, before + 1)
+    objects.failAll = true
+    await assert.rejects(store.getLatest(['failure']))
+    objects.failAll = false
+    const count = objects.listCalls
+    await store.getLatest(['failure'])
+    assert.equal(objects.listCalls, count + 1)
+  })
+
+  test('head records survive remote byte-cache eviction without introducing extra GETs', async t => {
+    const objects = new FakeObjectStore()
+    for (let i = 0; i < 70; i++) await seedSegments(objects, `s-${i}`, 1)
+    const {store} = await open(t, objects)
+    for (let i = 0; i < 70; i++) await store.getLatest([`s-${i}`])
+    const gets = objects.getCalls.length
+    const lists = objects.listCalls
+    await store.getLatest(['s-0'])
+    assert.equal(objects.getCalls.length, gets)
+    assert.equal(objects.listCalls, lists)
+  })
+
+  test('failed append rehydration invalidates head assumptions and retries safely', async t => {
+    const objects = new FakeObjectStore()
+    const [original] = await seedSegments(objects, 'original', 1)
+    for (let i = 0; i < 70; i++) await seedSegments(objects, `other-${i}`, 1)
+    const {store} = await open(t, objects)
+    await store.getLatest(['original'])
+    // Evict the original bytes while retaining its head metadata.
+    for (let i = 0; i < 70; i++) await store.getLatest([`other-${i}`])
+    objects.failAll = true
+    await assert.rejects(store.append({streamId: 'original', data: 'failed'}))
+    objects.failAll = false
+    const lists = objects.listCalls
+    const appended = await store.append({streamId: 'original', data: 'accepted'})
+    assert.equal(objects.listCalls, lists + 1)
+    assert.deepEqual((await store.read({streamId: 'original', limit: 2})).map(r => r.id), [original.id, appended.id])
+  })
+
+  test('evicted segment links are safely rediscovered', async t => {
+    const objects = new FakeObjectStore()
+    const streams = []
+    for (let i = 0; i < 5; i++) streams.push(await seedSegments(objects, `s-${i}`, 1001))
+    const {store} = await open(t, objects)
+    for (let i = 0; i < 5; i++) {
+      const page = await store.read({streamId: `s-${i}`, beforeId: streams[i].at(-1).id, limit: 1})
+      assert.equal(page[0].id, streams[i].at(-2).id)
+    }
+    assert.equal(objects.listCalls, 5)
+    const repeated = await store.read({streamId: 's-0', beforeId: streams[0].at(-1).id, limit: 1})
+    assert.equal(repeated[0].id, streams[0].at(-2).id)
+    assert.equal(objects.listCalls, 6)
+  })
+
+  test('local rotation needs no discovery while prior publication is blocked', async t => {
+    const objects = new FakeObjectStore()
+    const hold = objects.holdNextPut()
+    const {store} = await open(t, objects, {rotationTargetBytes: 1, checkpointDelayMilliseconds: 0})
+    const first = await store.append({streamId: 's', data: 'first'})
+    await hold.entered
+    try {
+      const second = await store.append({streamId: 's', data: 'second'})
+      const third = await store.append({streamId: 's', data: 'third'})
+      assert.deepEqual(await store.read({streamId: 's', limit: 50}), [first, second, third])
+      assert.deepEqual(await store.read({streamId: 's', afterId: first.id, limit: 50}), [second, third])
+      assert.equal(objects.listCalls, 1)
+    } finally { hold.release() }
+  })
+
+  test('rebuilds discovery after restart and merges unpublished local head with remote history', async t => {
+    const objects = new FakeObjectStore()
+    const old = await seedSegments(objects, 's', 3)
+    const {store, directory} = await open(t, objects, {rotationTargetBytes: 1})
+    const newest = await store.append({streamId: 's', data: 'not published'})
+    await store.close()
+    const hold = objects.holdNextPut()
+    const reopened = await openSegmentedOrderedRecordStore({dataDirectory: directory, objectStore: objects})
+    try {
+      await hold.entered
+      const start = objects.listCalls
+      assert.equal((await reopened.getLatest(['s'])).get('s').id, newest.id)
+      assert.equal(objects.listCalls, start, 'startup and local head need no discovery')
+      const read = await reopened.read({streamId: 's', afterId: old[0].id, limit: 50})
+      assert.deepEqual(read.map(r => r.id), [old[1].id, old[2].id, newest.id])
+      assert.equal(objects.listCalls, start + 1)
+      await reopened.read({streamId: 's', afterId: old[0].id, limit: 50})
+      assert.equal(objects.listCalls, start + 1)
+    } finally { hold.release(); await reopened.close() }
+  })
+})
+
+async function seedSegments(objects, streamId, count) {
+  const {createHash} = await import('node:crypto')
+  const {generateRecordIdentity, invertUuidHex} = await import('../dist/record-id.js')
+  const {encodeSegmentHeader, encodeRecordFrame} = await import('../dist/segment-codec.js')
+  const hash = createHash('sha256').update(streamId).digest('hex')
+  const records = []
+  for (let i = 0; i < count; i++) {
+    const identity = generateRecordIdentity()
+    const data = `record-${i}`
+    const key = `segments/v1/${hash.slice(0, 2)}/${hash.slice(2)}/${invertUuidHex(identity.segmentBytes)}-${identity.segmentHex}.ors`
+    objects.objects.set(key, Buffer.concat([
+      encodeSegmentHeader(streamId, identity.segmentBytes, identity.createdAtMilliseconds),
+      encodeRecordFrame(identity, data),
+    ]))
+    records.push({id: identity.id, streamId, data, createdAt: new Date(identity.createdAtMilliseconds).toISOString()})
+  }
+  return records
+}

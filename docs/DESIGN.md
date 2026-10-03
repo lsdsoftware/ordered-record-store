@@ -265,7 +265,7 @@ Downloading the whole object on the last path is intentional: the segment is onl
 
 A read or `getLatest()` uses a local segment when present. Otherwise it fetches, validates, and decodes the complete object, then retains it in a process-local 64-segment least-recently-used cache. Continued pagination and a later append can reuse those bytes without another `GetObject`; an append installs a reusable below-target object as the clean local working file before modifying it. The cache is disposable, is not scanned at startup, and is invalidated whenever this process successfully overwrites the corresponding S3 object.
 
-A `beforeId` or `afterId` cursor contains its segment UUID, so the store derives the exact local or S3 key directly. When backward pagination exhausts that segment, one newest-first prefix listing starting after its inverted segment key finds the immediately older segment. It does not enumerate the stream's entire history.
+A `beforeId` or `afterId` cursor contains its segment UUID, so the store derives the exact local or S3 key directly. When backward pagination exhausts that segment, a newest-first prefix listing starting after its inverted segment key discovers the immediately older segment and a bounded page of older neighbors. The discovered links are reused by subsequent traversal.
 
 Optional per-segment offset indexes may be introduced only after measuring performance. They are not required for the initial approximately 256 KiB segments or its small bounded decoded-object cache.
 
@@ -357,3 +357,35 @@ The binary format and single-prefix mutable-latest design above were explicitly 
 4. Inspect how `apsvc-diepkhuc-messenger` uses head-only retry suppression, opaque message cursors, `getLatest()`, and MySQL read positions.
 5. Start with the section 15 defaults and record any deliberate revision here before relying on it in code.
 6. Keep the durable adapter domain-neutral and resist copying the abandoned Messenger v2 S3 implementation wholesale.
+
+## 18. Shared bounded discovery metadata (2026-10-03)
+
+The 0.2.1 implementation adds an in-memory LRU of 1,024 heads, including known
+empty streams and decoded last records, and an LRU of 4,096 segment-link entries.
+Head knowledge is shared by latest lookup, history reads and append preparation.
+A local current segment remains authoritative even if its head metadata is
+evicted. Retaining a decoded head independently of the 64-segment byte cache
+avoids turning saved LISTs into repeated GETs.
+
+Forward reads stop at the known current head. Older/newer relationships are
+learned from this writer's rotations or complete intervals of successful LIST
+responses. Boundary listings request up to 1,000 keys and preserve all links
+from that page. Local unpublished segments are merged within the fully covered
+interval, so asynchronous oldest-first publication does not hide recent history.
+A page boundary does not prove the absence of additional older segments; only a
+short page proves that the remote interval ends. A newly created stream also
+proves its first segment has no predecessor.
+
+Known older relationships never change under append-only operation; new rotation
+updates the previous head's successor. No missing-successor result is cached
+independently of the current head. Stream serialization covers discovery and
+mutation, so a delayed LIST cannot supersede a newer local append. Failed
+mutations invalidate head/link assumptions for that stream. Failed discovery
+never becomes a cached empty result.
+
+All metadata is disposable, bounded and process-local. Clean-file eviction may
+retain head metadata, while metadata eviction or restart permits lazy
+rediscovery. No persisted catalog, manifest, new format version, startup S3
+scan, TTL refresh, or multi-writer coordination is added. Messenger no longer
+needs its own wrapper cache; it may use the head it already fetched to avoid an
+unread scan when the validated read position equals that head.

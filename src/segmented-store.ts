@@ -39,6 +39,18 @@ const DEFAULT_SWEEP_INTERVAL_MILLISECONDS = 60 * 60 * 1000
 const DEFAULT_RETRY_DELAY_MILLISECONDS = 30 * 1000
 const DEFAULT_MAX_CONCURRENT_OBJECT_OPERATIONS = 4
 const MAX_CACHED_REMOTE_SEGMENTS = 64
+const MAX_CACHED_HEADS = 1024
+const MAX_CACHED_LINKS = 4096
+const DISCOVERY_PAGE_SIZE = 1000
+
+interface CachedHead extends SegmentObject {
+  readonly record?: StoredRecord
+}
+
+interface SegmentLinks {
+  older?: string | null
+  newer?: string
+}
 
 interface LocalSegment {
   readonly streamId: string
@@ -94,6 +106,8 @@ class SegmentedOrderedRecordStore implements OrderedRecordStore {
   readonly #retryDelayMilliseconds: number
   readonly #objectLimiter: PriorityLimiter
   readonly #streams = new Map<string, StreamState>()
+  readonly #heads = new Map<string, CachedHead | null>()
+  readonly #links = new Map<string, SegmentLinks>()
   readonly #remoteSegments = new Map<string, CachedRemoteSegment>()
   readonly #sweepIntervalMilliseconds: number
   #sweepTimer: NodeJS.Timeout | null = null
@@ -171,17 +185,33 @@ class SegmentedOrderedRecordStore implements OrderedRecordStore {
     assertData(data)
     const stream = this.#getStream(streamId)
     return this.#withStream(stream, async () => {
-      let segment = await this.#ensureCurrentLocalSegment(stream)
-      if (segment !== null && segment.buffer.length >= this.#rotationTargetBytes) {
-        await this.#retireCurrentSegment(stream, segment)
-        segment = null
+      const previousHead = await this.#getHead(stream)
+      try {
+        let segment = await this.#ensureCurrentLocalSegment(stream, previousHead)
+        if (segment !== null && segment.buffer.length >= this.#rotationTargetBytes) {
+          await this.#retireCurrentSegment(stream, segment)
+          segment = null
+        }
+        const record = segment === null
+          ? await this.#createSegmentWithRecord(stream, data)
+          : await this.#appendToSegment(stream, segment, data)
+        const current = stream.segments.at(-1)!
+        const previousHex = previousHead === null ? null : parseObjectKey(stream.streamId, previousHead.key)
+        if (previousHex !== current.segmentHex) {
+          this.#rememberLink(stream, current.segmentHex, { older: previousHex })
+          if (previousHex !== null) this.#rememberLink(stream, previousHex, { newer: current.segmentHex })
+        }
+        remember(this.#heads, stream.streamId, { key: current.key, size: current.buffer.length, record }, MAX_CACHED_HEADS)
+        this.#kickUploadWorker(stream)
+        return record
+      } catch (error) {
+        this.#heads.delete(stream.streamId)
+        // Do not retain discovery assumptions across an uncertain mutation.
+        for (const key of this.#links.keys()) {
+          if (key.startsWith(`${stream.streamId}\0`)) this.#links.delete(key)
+        }
+        throw error
       }
-
-      const record = segment === null
-        ? await this.#createSegmentWithRecord(stream, data)
-        : await this.#appendToSegment(stream, segment, data)
-      this.#kickUploadWorker(stream)
-      return record
     })
   }
 
@@ -232,6 +262,8 @@ class SegmentedOrderedRecordStore implements OrderedRecordStore {
     await Promise.all(Array.from(this.#streams.values(), stream => stream.uploadWorker))
     await Promise.all(Array.from(this.#streams.values(), stream => stream.tail))
     this.#remoteSegments.clear()
+    this.#heads.clear()
+    this.#links.clear()
   }
 
   async #loadLocalFile(filePath: string): Promise<void> {
@@ -289,13 +321,11 @@ class SegmentedOrderedRecordStore implements OrderedRecordStore {
     })
   }
 
-  async #ensureCurrentLocalSegment(stream: StreamState): Promise<LocalSegment | null> {
+  async #ensureCurrentLocalSegment(stream: StreamState, newest: SegmentObject | null): Promise<LocalSegment | null> {
     const current = stream.segments.at(-1)
     if (current !== undefined) return current
 
-    const objects = await this.#listObjects({ prefix: objectPrefix(stream.streamId), limit: 1 })
-    const newest = objects[0]
-    if (newest === undefined || newest.size >= this.#rotationTargetBytes) return null
+    if (newest === null || newest.size >= this.#rotationTargetBytes) return null
     const segmentHex = parseObjectKey(stream.streamId, newest.key)
     const remote = await this.#getRemoteSegment(stream.streamId, segmentHex, newest.key)
     if (remote === null) throw corrupt(`listed segment disappeared: ${newest.key}`)
@@ -516,23 +546,39 @@ class SegmentedOrderedRecordStore implements OrderedRecordStore {
     return result
   }
 
+  #knownHead(stream: StreamState): CachedHead | null | undefined {
+    const local = stream.segments.at(-1)
+    if (local !== undefined) return { key: local.key, size: local.buffer.length, record: local.records.at(-1)! }
+    return recall(this.#heads, stream.streamId)
+  }
+
+  async #getHead(stream: StreamState): Promise<CachedHead | null> {
+    const known = this.#knownHead(stream)
+    if (known !== undefined) return known
+    const objects = await this.#listObjects({ prefix: objectPrefix(stream.streamId), limit: 1 })
+    const head = objects[0] ?? null
+    if (head !== null) parseObjectKey(stream.streamId, head.key)
+    remember(this.#heads, stream.streamId, head, MAX_CACHED_HEADS)
+    return head
+  }
+
   async #getLatestForStream(stream: StreamState): Promise<StoredRecord | null> {
     const current = stream.segments.at(-1)
     if (current !== undefined) return current.records.at(-1) ?? null
-    const objects = await this.#listObjects({ prefix: objectPrefix(stream.streamId), limit: 1 })
-    const newest = objects[0]
-    if (newest === undefined) return null
+    const newest = await this.#getHead(stream)
+    if (newest === null) return null
+    if (newest.record !== undefined) return newest.record
     const segmentHex = parseObjectKey(stream.streamId, newest.key)
     const remote = await this.#getRemoteSegment(stream.streamId, segmentHex, newest.key)
     if (remote === null) throw corrupt(`listed segment disappeared: ${newest.key}`)
-    return remote.decoded.records.at(-1)!
+    const record = remote.decoded.records.at(-1)!
+    remember(this.#heads, stream.streamId, { ...newest, record }, MAX_CACHED_HEADS)
+    return record
   }
 
   async #findHeadSegmentHex(stream: StreamState): Promise<string | null> {
-    const local = stream.segments.at(-1)
-    if (local !== undefined) return local.segmentHex
-    const objects = await this.#listObjects({ prefix: objectPrefix(stream.streamId), limit: 1 })
-    return objects[0] === undefined ? null : parseObjectKey(stream.streamId, objects[0].key)
+    const head = await this.#getHead(stream)
+    return head === null ? null : parseObjectKey(stream.streamId, head.key)
   }
 
   async #loadSegment(stream: StreamState, segmentHex: string): Promise<DecodedSegment> {
@@ -543,57 +589,74 @@ class SegmentedOrderedRecordStore implements OrderedRecordStore {
     const key = objectKey(stream.streamId, segmentBytesFromHex(segmentHex))
     const remote = await this.#getRemoteSegment(stream.streamId, segmentHex, key)
     if (remote === null) throw invalidBoundary()
+    const head = this.#knownHead(stream)
+    if (head?.key === key) {
+      remember(this.#heads, stream.streamId, { ...head, record: remote.decoded.records.at(-1)! }, MAX_CACHED_HEADS)
+    }
     return remote.decoded
   }
 
+  #rememberLink(stream: StreamState, segmentHex: string, link: SegmentLinks): void {
+    const key = `${stream.streamId}\0${segmentHex}`
+    remember(this.#links, key, { ...this.#links.get(key), ...link }, MAX_CACHED_LINKS)
+  }
+
+  /** Merge the fully listed key interval with unpublished local segments. */
+  #rememberPage(stream: StreamState, upper: string | undefined, page: readonly SegmentObject[]): string[] {
+    const remote = page.map(object => parseObjectKey(stream.streamId, object.key))
+    const complete = page.length < DISCOVERY_PAGE_SIZE
+    const bottom = remote.at(-1)
+    const local = stream.segments.map(segment => segment.segmentHex)
+      .filter(hex => (upper === undefined || hex < upper) && (complete || hex >= bottom!))
+    const descending = [...new Set([...remote, ...local])].sort().reverse()
+    if (upper !== undefined) descending.unshift(upper)
+    for (let i = 1; i < descending.length; i++) {
+      this.#rememberLink(stream, descending[i - 1]!, { older: descending[i]! })
+      this.#rememberLink(stream, descending[i]!, { newer: descending[i - 1]! })
+    }
+    if (complete && descending.length) {
+      this.#rememberLink(stream, descending.at(-1)!, { older: null })
+    }
+    return descending
+  }
+
   async #findOlderSegmentHex(stream: StreamState, segmentHex: string): Promise<string | null> {
-    const segmentBytes = segmentBytesFromHex(segmentHex)
-    const local = stream.segments
-      .filter(segment => Buffer.compare(segment.segmentBytes, segmentBytes) < 0)
-      .sort(compareSegments)
-      .at(-1)
-    const currentKey = objectKey(stream.streamId, segmentBytes)
-    const remote = (await this.#listObjects({
+    const known = recall(this.#links, `${stream.streamId}\0${segmentHex}`)?.older
+    if (known !== undefined) return known
+    const page = await this.#listObjects({
       prefix: objectPrefix(stream.streamId),
-      startAfter: currentKey,
-      limit: 1,
-    }))[0]
-    const remoteHex = remote === undefined ? null : parseObjectKey(stream.streamId, remote.key)
-    if (local === undefined) return remoteHex
-    if (remoteHex === null) return local.segmentHex
-    return Buffer.compare(local.segmentBytes, segmentBytesFromHex(remoteHex)) > 0
-      ? local.segmentHex
-      : remoteHex
+      startAfter: objectKey(stream.streamId, segmentBytesFromHex(segmentHex)),
+      limit: DISCOVERY_PAGE_SIZE,
+    })
+    return this.#rememberPage(stream, segmentHex, page)[1] ?? null
   }
 
   async #findNewerSegmentHex(stream: StreamState, segmentHex: string): Promise<string | null> {
-    const segmentBytes = segmentBytesFromHex(segmentHex)
-    const local = stream.segments
-      .filter(segment => Buffer.compare(segment.segmentBytes, segmentBytes) > 0)
-      .sort(compareSegments)[0]
-    const prefix = objectPrefix(stream.streamId)
-    const boundaryKey = objectKey(stream.streamId, segmentBytes)
-    let startAfter: string | undefined
-    let remoteHex: string | null = null
+    const known = recall(this.#links, `${stream.streamId}\0${segmentHex}`)?.newer
+    if (known !== undefined) return known
+    const head = this.#knownHead(stream)
+    if (head !== undefined && head !== null && parseObjectKey(stream.streamId, head.key) === segmentHex) return null
+
+    // Keys sort newest first. Each page proves all adjacencies in its interval,
+    // so the next forward step can reuse the same discovery rather than relist.
+    let upper: string | undefined
     for (;;) {
-      const page = await this.#listObjects({ prefix, startAfter, limit: 1_000 })
-      if (page.length === 0) break
-      let reachedBoundary = false
-      for (const object of page) {
-        if (object.key >= boundaryKey) {
-          reachedBoundary = true
-          break
-        }
-        remoteHex = parseObjectKey(stream.streamId, object.key)
+      const page = await this.#listObjects({
+        prefix: objectPrefix(stream.streamId),
+        startAfter: upper === undefined ? undefined : objectKey(stream.streamId, segmentBytesFromHex(upper)),
+        limit: DISCOVERY_PAGE_SIZE,
+      })
+      const descending = this.#rememberPage(stream, upper, page)
+      if (upper === undefined) {
+        const local = stream.segments.at(-1)
+        remember(this.#heads, stream.streamId,
+          local ? { key: local.key, size: local.buffer.length } : page[0] ?? null, MAX_CACHED_HEADS)
       }
-      if (reachedBoundary || page.length < 1_000) break
-      startAfter = page.at(-1)!.key
+      const index = descending.indexOf(segmentHex)
+      if (index >= 0) return index === 0 ? null : descending[index - 1]!
+      if (page.length < DISCOVERY_PAGE_SIZE) return null
+      upper = parseObjectKey(stream.streamId, page.at(-1)!.key)
     }
-    if (local === undefined) return remoteHex
-    if (remoteHex === null) return local.segmentHex
-    return Buffer.compare(local.segmentBytes, segmentBytesFromHex(remoteHex)) < 0
-      ? local.segmentHex
-      : remoteHex
   }
 
   #kickUploadWorker(stream: StreamState): void {
@@ -706,6 +769,9 @@ class SegmentedOrderedRecordStore implements OrderedRecordStore {
   }
 
   async #removeLocalSegment(stream: StreamState, segment: LocalSegment): Promise<void> {
+    if (stream.segments.at(-1) === segment) {
+      remember(this.#heads, stream.streamId, { key: segment.key, size: segment.buffer.length, record: segment.records.at(-1)! }, MAX_CACHED_HEADS)
+    }
     await unlink(segment.path).catch(error => {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     })
@@ -922,4 +988,20 @@ function invalidBoundary(): OrderedRecordStoreError {
 
 function corrupt(message: string): OrderedRecordStoreError {
   return new OrderedRecordStoreError('CORRUPT_DATA', message)
+}
+
+/** Small LRU helpers; null is cached knowledge, undefined is a miss. */
+function recall<K, V>(cache: Map<K, V>, key: K): V | undefined {
+  const value = cache.get(key)
+  if (value !== undefined) {
+    cache.delete(key)
+    cache.set(key, value)
+  }
+  return value
+}
+
+function remember<K, V>(cache: Map<K, V>, key: K, value: V, capacity: number): void {
+  cache.delete(key)
+  cache.set(key, value)
+  while (cache.size > capacity) cache.delete(cache.keys().next().value!)
 }

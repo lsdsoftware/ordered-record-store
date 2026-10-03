@@ -104,3 +104,20 @@ npm run build
 ```
 
 The package is published and consumed by `apsvc-diepkhuc-messenger` as a versioned npm dependency.
+
+## Discovery cache
+
+Version 0.2.1 shares a disposable LRU of 1,024 stream heads (including empty
+streams and decoded latest records) across `getLatest`, `read`, and `append`.
+A separate 4,096-entry LRU retains proven older/newer segment links and known
+oldest boundaries. No TTL or remote validation is needed under the single-writer
+contract. Appends update heads; rotation establishes links; uncertain mutation
+failures invalidate the stream's discovery metadata.
+
+Reads stop at the known head. On an unknown boundary, discovery lists up to
+1,000 keys and retains the relationships established by the complete returned
+interval, merged with unpublished local segments. Arbitrary cached segments are
+never assumed adjacent. Metadata eviction permits rediscovery; restart rebuilds
+only the local working set. Evicting clean local bytes can retain their head
+metadata. These caches do not change the on-disk format, checkpoint scheduling,
+ordered publication, or the 64-segment remote byte cache.
